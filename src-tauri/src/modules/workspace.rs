@@ -392,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_path_maps_wsl_paths_to_unc() {
+    fn resolve_path_maps_wsl_paths_to_host() {
         let workspace = WorkspaceEnv::Wsl {
             distro: "Ubuntu".into(),
         };
