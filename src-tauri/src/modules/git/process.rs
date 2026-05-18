@@ -15,7 +15,7 @@ use crate::modules::git::types::{
     GitOutput, TextSource, DEFAULT_TIMEOUT_SECS, MAX_FILE_BYTES, MAX_OUTPUT_BYTES,
     MAX_TIMEOUT_SECS, MIN_GIT_VERSION,
 };
-use crate::modules::workspace::WorkspaceEnv;
+use crate::modules::workspace::{validate_wsl_distro_name, WorkspaceEnv};
 
 #[derive(Clone)]
 enum Availability {
@@ -247,7 +247,7 @@ where
         .into_iter()
         .map(|arg| arg.as_ref().to_os_string())
         .collect();
-    let mut cmd = build_git_command(workspace, cwd, &args);
+    let mut cmd = build_git_command(workspace, cwd, &args)?;
     cmd.env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_ASKPASS", "")
         .env("SSH_ASKPASS", "")
@@ -299,9 +299,15 @@ where
     })
 }
 
-fn build_git_command(_workspace: &WorkspaceEnv, cwd: Option<&str>, args: &[OsString]) -> Command {
+fn build_git_command(
+    _workspace: &WorkspaceEnv,
+    cwd: Option<&str>,
+    args: &[OsString],
+) -> Result<Command> {
     #[cfg(windows)]
     if let WorkspaceEnv::Wsl { distro } = _workspace {
+        validate_wsl_distro_name(distro)
+            .map_err(|_| GitError::command("unsafe WSL distro name", distro.clone()))?;
         let mut cmd = Command::new("wsl.exe");
         cmd.arg("-d").arg(distro);
         if let Some(cwd) = cwd.filter(|s| !s.is_empty()) {
@@ -309,7 +315,7 @@ fn build_git_command(_workspace: &WorkspaceEnv, cwd: Option<&str>, args: &[OsStr
         }
         cmd.arg("--exec").arg("git");
         cmd.args(args);
-        return cmd;
+        return Ok(cmd);
     }
 
     let mut cmd = Command::new("git");
@@ -317,7 +323,7 @@ fn build_git_command(_workspace: &WorkspaceEnv, cwd: Option<&str>, args: &[OsStr
     if let Some(dir) = cwd.filter(|s| !s.is_empty()) {
         cmd.current_dir(Path::new(dir));
     }
-    cmd
+    Ok(cmd)
 }
 
 pub fn ensure_success(output: &GitOutput, context: &'static str) -> Result<()> {
@@ -472,7 +478,8 @@ mod tests {
             },
             Some("/home/vinicios/Nova pasta/repo"),
             &[OsString::from("status"), OsString::from("--short")],
-        );
+        )
+        .expect("valid WSL distro");
         let program = cmd.get_program().to_string_lossy().into_owned();
         let args: Vec<String> = cmd
             .get_args()
@@ -492,5 +499,19 @@ mod tests {
                 "--short",
             ]
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn rejects_unsafe_wsl_distro_name_for_git_command() {
+        let err = build_git_command(
+            &WorkspaceEnv::Wsl {
+                distro: "../Ubuntu".into(),
+            },
+            None,
+            &[],
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("unsafe WSL distro name"));
     }
 }

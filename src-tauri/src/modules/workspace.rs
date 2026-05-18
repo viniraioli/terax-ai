@@ -111,6 +111,15 @@ fn is_safe_distro_name(name: &str) -> bool {
 }
 
 #[cfg(windows)]
+pub(crate) fn validate_wsl_distro_name(distro: &str) -> Result<(), String> {
+    if is_safe_distro_name(distro) {
+        Ok(())
+    } else {
+        Err(format!("unsafe WSL distro name: {distro}"))
+    }
+}
+
+#[cfg(windows)]
 fn wsl_drvfs_to_windows(path: &str) -> Option<PathBuf> {
     let normalized = path.replace('\\', "/");
     let rest = normalized.strip_prefix("/mnt/")?;
@@ -204,14 +213,36 @@ fn run_wsl(args: &[&str]) -> Result<String, String> {
 }
 
 #[cfg(windows)]
-fn run_wsl_sh(distro: &str, script: &str) -> Result<String, String> {
-    // Probe helpers must avoid login-shell startup files. User `.profile`
-    // output on stdout would corrupt the parsed value (`$HOME`, login shell).
-    run_wsl(&["-d", distro, "--exec", "sh", "-c", script])
+pub(crate) fn wsl_exec_capture(
+    distro: &str,
+    program: &str,
+    args: &[&str],
+) -> Result<String, String> {
+    validate_wsl_distro_name(distro)?;
+    let out = std::process::Command::new("wsl.exe")
+        .arg("-d")
+        .arg(distro)
+        .arg("--exec")
+        .arg(program)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !out.status.success() {
+        let stderr = decode_command_output(&out.stderr);
+        return Err(stderr.trim().to_string());
+    }
+    Ok(decode_command_output(&out.stdout))
 }
 
 #[cfg(windows)]
-fn normalize_wsl_value(output: String, fallback: &str) -> String {
+fn run_wsl_sh(distro: &str, script: &str) -> Result<String, String> {
+    // Probe helpers must avoid login-shell startup files. User `.profile`
+    // output on stdout would corrupt the parsed value (`$HOME`, login shell).
+    wsl_exec_capture(distro, "sh", &["-c", script])
+}
+
+#[cfg(windows)]
+pub(crate) fn normalize_wsl_value(output: String, fallback: &str) -> String {
     let value = output
         .lines()
         .rev()

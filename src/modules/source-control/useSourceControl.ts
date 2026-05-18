@@ -163,10 +163,6 @@ export function useSourceControl(
   const inflightModeRef = useRef<SourceControlRefreshMode>("never");
   const autoFetchByRepoRef = useRef(new Map<string, number>());
   const enabledRef = useRef(enabled);
-  // Path → resolved repo root (or null when path is not inside a repo).
-  // Lets us skip git_panel_snapshot when navigating inside an already-known
-  // repo (or between non-repo paths) and reuse the cheaper git_status call.
-  const repoLookupRef = useRef(new Map<string, string | null>());
 
   useEffect(() => {
     stateRef.current = state;
@@ -181,7 +177,6 @@ export function useSourceControl(
     inflightRef.current = null;
     inflightModeRef.current = "never";
     autoFetchByRepoRef.current.clear();
-    repoLookupRef.current.clear();
     setState({
       repo: null,
       status: null,
@@ -223,31 +218,12 @@ export function useSourceControl(
         return;
       }
 
-      const lookup = repoLookupRef.current;
-      const cachedRoot = lookup.get(contextPath);
-      const reusableRoot = (() => {
-        if (cachedRoot !== undefined) return cachedRoot;
-        for (const [, root] of lookup) {
-          if (root && contextPath.startsWith(`${root}/`)) return root;
-        }
-        return undefined;
-      })();
-
-      if (reusableRoot === null) {
-        setState((current) =>
-          current.hasRepo || current.repo || current.status
-            ? {
-                ...current,
-                repo: null,
-                status: null,
-                hasRepo: false,
-                isLoading: false,
-                localError: null,
-              }
-            : current,
-        );
-        return;
-      }
+      const activeRoot = stateRef.current.repo?.repoRoot ?? null;
+      const reusableRoot =
+        activeRoot &&
+        (contextPath === activeRoot || contextPath.startsWith(`${activeRoot}/`))
+          ? activeRoot
+          : undefined;
 
       setState((current) => ({ ...current, isLoading: true, localError: null }));
 
@@ -256,21 +232,38 @@ export function useSourceControl(
         let status: GitStatusSnapshot | null;
 
         if (reusableRoot) {
-          repo = stateRef.current.repo ?? null;
-          status = await native.gitStatus(reusableRoot);
-          if (requestId !== requestIdRef.current) return;
-          if (!repo || repo.repoRoot !== reusableRoot) {
-            repo = {
-              repoRoot: reusableRoot,
-              branch: status.branch,
-              upstream: status.upstream,
-              isDetached: status.isDetached,
-            };
+          try {
+            repo = stateRef.current.repo ?? null;
+            status = await native.gitStatus(reusableRoot);
+            if (requestId !== requestIdRef.current) return;
+            if (!repo || repo.repoRoot !== reusableRoot) {
+              repo = {
+                repoRoot: reusableRoot,
+                branch: status.branch,
+                upstream: status.upstream,
+                isDetached: status.isDetached,
+              };
+            }
+          } catch {
+            const snapshot = await native.gitPanelSnapshot(contextPath);
+            if (requestId !== requestIdRef.current) return;
+            if (!snapshot.repo) {
+              setState((current) => ({
+                ...current,
+                repo: null,
+                status: null,
+                hasRepo: false,
+                isLoading: false,
+                localError: null,
+              }));
+              return;
+            }
+            repo = snapshot.repo;
+            status = snapshot.status ?? null;
           }
         } else {
           const snapshot = await native.gitPanelSnapshot(contextPath);
           if (requestId !== requestIdRef.current) return;
-          lookup.set(contextPath, snapshot.repo?.repoRoot ?? null);
           if (!snapshot.repo) {
             setState((current) => ({
               ...current,
@@ -297,8 +290,6 @@ export function useSourceControl(
           }));
           return;
         }
-
-        lookup.set(contextPath, repo.repoRoot);
 
         let nextRemoteError = stateRef.current.lastRemoteError;
         const shouldAutoFetch =
@@ -333,7 +324,6 @@ export function useSourceControl(
         }));
       } catch (error) {
         if (requestId !== requestIdRef.current) return;
-        lookup.delete(contextPath);
         setState((current) => ({
           ...current,
           repo: null,

@@ -200,14 +200,8 @@ mod unix {
                 cmd.arg("-i");
             }
             Shell::Fish => {
-                match prepare_fish_init() {
-                    Ok(init) => {
-                        cmd.arg("--init-command");
-                        cmd.arg(format!("source {}", shell_quote(&init)));
-                    }
-                    Err(e) => {
-                        log::warn!("fish shell integration disabled: {e}");
-                    }
+                if let Err(e) = prepare_fish_conf_d() {
+                    log::warn!("fish shell integration disabled: {e}");
                 }
                 cmd.arg("-i");
             }
@@ -219,11 +213,6 @@ mod unix {
             }
         }
         Ok(cmd)
-    }
-
-    fn shell_quote(p: &Path) -> String {
-        let s = p.to_string_lossy();
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 
     fn integration_root() -> Result<PathBuf, String> {
@@ -251,12 +240,12 @@ mod unix {
         Ok(rc)
     }
 
-    fn prepare_fish_init() -> Result<PathBuf, String> {
-        let dir = integration_root()?.join("fish");
+    fn prepare_fish_conf_d() -> Result<(), String> {
+        let home = dirs::home_dir().ok_or_else(|| "could not resolve home dir".to_string())?;
+        let dir = home.join(".config").join("fish").join("conf.d");
         fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-        let init = dir.join("init.fish");
-        write_if_changed(&init, FISH_INIT)?;
-        Ok(init)
+        write_if_changed(&dir.join("terax.fish"), FISH_INIT)?;
+        Ok(())
     }
 
     fn write_if_changed(path: &Path, content: &str) -> Result<(), String> {
@@ -309,9 +298,12 @@ mod windows {
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     enum WslShellIntegration {
-        Zsh { zdotdir: String },
+        Zsh {
+            zdotdir: String,
+            user_zdotdir: Option<String>,
+        },
         Bash { rcfile: String },
-        Fish { init: String },
+        Fish,
         None,
     }
 
@@ -358,11 +350,25 @@ mod windows {
     }
 
     fn build_wsl(cwd: Option<String>, distro: String) -> Result<CommandBuilder, String> {
+        crate::modules::workspace::validate_wsl_distro_name(&distro)?;
         let shell_path = crate::modules::workspace::wsl_login_shell(distro.clone())?;
         let shell_kind = ShellKind::from_path(&shell_path);
         let integration = match shell_kind {
             ShellKind::Zsh => match prepare_wsl_zdotdir(&distro) {
-                Ok(zdotdir) => WslShellIntegration::Zsh { zdotdir },
+                Ok(zdotdir) => {
+                    let user_zdotdir = match probe_wsl_zdotdir(&distro, &shell_path) {
+                        Ok(path) if !path.is_empty() && path != zdotdir => Some(path),
+                        Ok(_) => None,
+                        Err(e) => {
+                            log::warn!("WSL zsh ZDOTDIR probe failed for {distro}: {e}");
+                            None
+                        }
+                    };
+                    WslShellIntegration::Zsh {
+                        zdotdir,
+                        user_zdotdir,
+                    }
+                }
                 Err(e) => {
                     log::warn!("WSL zsh shell integration disabled for {distro}: {e}");
                     WslShellIntegration::None
@@ -375,8 +381,8 @@ mod windows {
                     WslShellIntegration::None
                 }
             },
-            ShellKind::Fish => match prepare_wsl_fish_init(&distro) {
-                Ok(init) => WslShellIntegration::Fish { init },
+            ShellKind::Fish => match prepare_wsl_fish_conf_d(&distro) {
+                Ok(()) => WslShellIntegration::Fish,
                 Err(e) => {
                     log::warn!("WSL fish shell integration disabled for {distro}: {e}");
                     WslShellIntegration::None
@@ -424,8 +430,17 @@ mod windows {
             "--exec".to_string(),
         ];
         match (shell_kind, integration) {
-            (ShellKind::Zsh, WslShellIntegration::Zsh { zdotdir }) => {
+            (
+                ShellKind::Zsh,
+                WslShellIntegration::Zsh {
+                    zdotdir,
+                    user_zdotdir,
+                },
+            ) => {
                 args.push("env".to_string());
+                if let Some(user_zdotdir) = user_zdotdir {
+                    args.push(format!("TERAX_USER_ZDOTDIR={user_zdotdir}"));
+                }
                 args.push(format!("ZDOTDIR={zdotdir}"));
                 args.push(shell_path.to_string());
                 args.push("-l".to_string());
@@ -436,10 +451,8 @@ mod windows {
                 args.push(rcfile);
                 args.push("-i".to_string());
             }
-            (ShellKind::Fish, WslShellIntegration::Fish { init }) => {
+            (ShellKind::Fish, WslShellIntegration::Fish) => {
                 args.push(shell_path.to_string());
-                args.push("--init-command".to_string());
-                args.push(format!("source {}", shell_quote(&init)));
                 args.push("-i".to_string());
             }
             (ShellKind::Zsh, WslShellIntegration::None) => {
@@ -459,8 +472,13 @@ mod windows {
         WslLaunchSpec { args }
     }
 
-    fn shell_quote(value: &str) -> String {
-        format!("'{}'", value.replace('\'', "'\\''"))
+    fn probe_wsl_zdotdir(distro: &str, shell_path: &str) -> Result<String, String> {
+        let out = crate::modules::workspace::wsl_exec_capture(
+            distro,
+            shell_path,
+            &["-c", r#"printf %s "${ZDOTDIR:-$HOME}""#],
+        )?;
+        Ok(crate::modules::workspace::normalize_wsl_value(out, ""))
     }
 
     fn prepare_wsl_integration_dir(distro: &str, shell: &str) -> Result<(String, PathBuf), String> {
@@ -508,13 +526,15 @@ mod windows {
         Ok(linux_rc)
     }
 
-    fn prepare_wsl_fish_init(distro: &str) -> Result<String, String> {
-        let (linux_dir, unc_dir) = prepare_wsl_integration_dir(distro, "fish")?;
-        let linux_init = format!("{linux_dir}/init.fish");
-        let unc_file = unc_dir.join("init.fish");
+    fn prepare_wsl_fish_conf_d(distro: &str) -> Result<(), String> {
+        let home = crate::modules::workspace::wsl_home(distro.to_string())?;
+        let linux_dir = format!("{}/.config/fish/conf.d", home.trim_end_matches('/'));
+        let unc_dir = crate::modules::workspace::wsl_path_to_unc(distro, &linux_dir);
+        fs::create_dir_all(&unc_dir).map_err(|e| format!("create {}: {e}", unc_dir.display()))?;
+        let unc_file = unc_dir.join("terax.fish");
         let content = normalize_script(super::fish_init_script());
         write_if_changed(&unc_file, &content)?;
-        Ok(linux_init)
+        Ok(())
     }
 
     fn integration_root() -> Result<PathBuf, String> {
@@ -561,6 +581,7 @@ mod windows {
                 ShellKind::Zsh,
                 WslShellIntegration::Zsh {
                     zdotdir: "/home/vinicios/.cache/terax/shell-integration/zsh".into(),
+                    user_zdotdir: None,
                 },
             );
             assert_eq!(
@@ -572,6 +593,35 @@ mod windows {
                     "/home/vinicios/repo".to_string(),
                     "--exec".to_string(),
                     "env".to_string(),
+                    "ZDOTDIR=/home/vinicios/.cache/terax/shell-integration/zsh".to_string(),
+                    "/usr/bin/zsh".to_string(),
+                    "-l".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn builds_wsl_zsh_launch_spec_with_user_zdotdir_probe() {
+            let spec = build_wsl_launch_spec(
+                Some("/home/vinicios/repo"),
+                "Ubuntu",
+                "/usr/bin/zsh",
+                ShellKind::Zsh,
+                WslShellIntegration::Zsh {
+                    zdotdir: "/home/vinicios/.cache/terax/shell-integration/zsh".into(),
+                    user_zdotdir: Some("/home/vinicios/.config/zsh".into()),
+                },
+            );
+            assert_eq!(
+                spec.args,
+                vec![
+                    "-d".to_string(),
+                    "Ubuntu".to_string(),
+                    "--cd".to_string(),
+                    "/home/vinicios/repo".to_string(),
+                    "--exec".to_string(),
+                    "env".to_string(),
+                    "TERAX_USER_ZDOTDIR=/home/vinicios/.config/zsh".to_string(),
                     "ZDOTDIR=/home/vinicios/.cache/terax/shell-integration/zsh".to_string(),
                     "/usr/bin/zsh".to_string(),
                     "-l".to_string(),
@@ -624,6 +674,29 @@ mod windows {
                     "/bin/bash".to_string(),
                     "--rcfile".to_string(),
                     "/home/vinicios/.cache/terax/shell-integration/bash/bashrc".to_string(),
+                    "-i".to_string(),
+                ]
+            );
+        }
+
+        #[test]
+        fn builds_wsl_fish_launch_spec_without_init_command() {
+            let spec = build_wsl_launch_spec(
+                Some("/home/vinicios/repo"),
+                "Ubuntu",
+                "/usr/bin/fish",
+                ShellKind::Fish,
+                WslShellIntegration::Fish,
+            );
+            assert_eq!(
+                spec.args,
+                vec![
+                    "-d".to_string(),
+                    "Ubuntu".to_string(),
+                    "--cd".to_string(),
+                    "/home/vinicios/repo".to_string(),
+                    "--exec".to_string(),
+                    "/usr/bin/fish".to_string(),
                     "-i".to_string(),
                 ]
             );
