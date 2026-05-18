@@ -3,6 +3,7 @@ import {
   type GitRepoInfo,
   type GitStatusSnapshot,
 } from "@/modules/ai/lib/native";
+import { useWorkspaceEnvStore } from "@/modules/workspace";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 const AUTO_FETCH_THROTTLE_MS = 5 * 60_000;
@@ -145,6 +146,9 @@ export function useSourceControl(
   contextPath: string | null,
   enabled: boolean = true,
 ): SourceControlSummary {
+  const workspaceEnv = useWorkspaceEnvStore((s) => s.env);
+  const workspaceKey =
+    workspaceEnv.kind === "wsl" ? `wsl:${workspaceEnv.distro}` : "local";
   const [state, setState] = useState<SourceControlSummaryState>({
     repo: null,
     status: null,
@@ -172,6 +176,23 @@ export function useSourceControl(
   useEffect(() => {
     enabledRef.current = enabled;
   }, [enabled]);
+
+  useEffect(() => {
+    requestIdRef.current++;
+    inflightRef.current = null;
+    inflightModeRef.current = "never";
+    autoFetchByRepoRef.current.clear();
+    repoLookupRef.current.clear();
+    setState({
+      repo: null,
+      status: null,
+      hasRepo: false,
+      isLoading: false,
+      localError: null,
+      busyAction: null,
+      lastRemoteError: null,
+    });
+  }, [workspaceKey]);
 
   const applyStatus = useCallback(
     (updater: (status: GitStatusSnapshot) => GitStatusSnapshot) => {
@@ -278,6 +299,8 @@ export function useSourceControl(
           return;
         }
 
+        lookup.set(contextPath, repo.repoRoot);
+
         let nextRemoteError = stateRef.current.lastRemoteError;
         const shouldAutoFetch =
           repo.upstream &&
@@ -311,15 +334,18 @@ export function useSourceControl(
         }));
       } catch (error) {
         if (requestId !== requestIdRef.current) return;
+        lookup.delete(contextPath);
         setState((current) => ({
           ...current,
+          repo: null,
+          hasRepo: false,
           status: null,
           isLoading: false,
           localError: normalizeError(error),
         }));
       }
     },
-    [contextPath],
+    [contextPath, workspaceKey],
   );
 
   const refresh = useCallback(
@@ -424,7 +450,7 @@ export function useSourceControl(
         window.clearTimeout(idle as number);
       }
     };
-  }, [refresh, contextPath, enabled]);
+  }, [refresh, contextPath, enabled, workspaceKey]);
 
   useEffect(() => {
     if (!enabled) return;

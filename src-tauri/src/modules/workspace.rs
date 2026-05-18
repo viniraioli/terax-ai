@@ -35,9 +35,12 @@ pub fn bootstrap_registry(registry: &WorkspaceRegistry) {
 #[tauri::command]
 pub async fn workspace_authorize(
     path: String,
+    workspace: Option<WorkspaceEnv>,
     registry: tauri::State<'_, WorkspaceRegistry>,
 ) -> Result<String, String> {
-    let canonical = registry.authorize(&path).map_err(|e| e.to_string())?;
+    let workspace = WorkspaceEnv::from_option(workspace);
+    let resolved = resolve_path(&path, &workspace);
+    let canonical = registry.authorize(&resolved).map_err(|e| e.to_string())?;
     Ok(canonical.to_string_lossy().replace('\\', "/"))
 }
 
@@ -49,8 +52,6 @@ pub async fn workspace_current_dir(
     let canonical = registry.authorize(&cwd).map_err(|e| e.to_string())?;
     Ok(canonical.to_string_lossy().replace('\\', "/"))
 }
-
-
 
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
@@ -174,6 +175,28 @@ fn run_wsl(args: &[&str]) -> Result<String, String> {
 }
 
 #[cfg(windows)]
+fn run_wsl_sh(distro: &str, script: &str) -> Result<String, String> {
+    // Probe helpers must avoid login-shell startup files. User `.profile`
+    // output on stdout would corrupt the parsed value (`$HOME`, login shell).
+    run_wsl(&["-d", distro, "--exec", "sh", "-c", script])
+}
+
+#[cfg(windows)]
+fn normalize_wsl_value(output: String, fallback: &str) -> String {
+    let value = output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("");
+    if value.is_empty() {
+        fallback.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
+#[cfg(windows)]
 fn list_distros_blocking() -> Result<Vec<WslDistro>, String> {
     let out = run_wsl(&["--list", "--verbose"])?;
     let mut distros = Vec::new();
@@ -244,14 +267,40 @@ pub fn wsl_home(distro: String) -> Result<String, String> {
     }
     #[cfg(windows)]
     {
-        let out = run_wsl(&["-d", &distro, "--exec", "sh", "-lc", "printf %s \"$HOME\""])?;
-        let home = out.trim().to_string();
+        let out = run_wsl_sh(&distro, "printf %s \"$HOME\"")?;
+        let home = normalize_wsl_value(out, "");
         if home.is_empty() {
             Err(format!("could not resolve WSL home for {distro}"))
         } else {
             Ok(home)
         }
     }
+}
+
+#[cfg(windows)]
+pub fn wsl_login_shell(distro: String) -> Result<String, String> {
+    const SCRIPT: &str = r#"uid="$(id -u 2>/dev/null || printf '')"
+entry=''
+if [ -n "$uid" ] && command -v getent >/dev/null 2>&1; then
+  entry="$(getent passwd "$uid" 2>/dev/null || true)"
+fi
+if [ -z "$entry" ] && [ -n "$uid" ] && [ -r /etc/passwd ]; then
+  entry="$(awk -F: -v u="$uid" '$3 == u { print; exit }' /etc/passwd 2>/dev/null)"
+fi
+shell=''
+if [ -n "$entry" ]; then
+  shell="${entry##*:}"
+fi
+if [ -z "$shell" ] && [ -n "$SHELL" ]; then
+  shell="$SHELL"
+fi
+if [ -z "$shell" ]; then
+  shell=/bin/sh
+fi
+printf %s "$shell""#;
+
+    let out = run_wsl_sh(&distro, SCRIPT)?;
+    Ok(normalize_wsl_value(out, "/bin/sh"))
 }
 
 #[cfg(all(test, windows))]
@@ -302,5 +351,18 @@ mod tests {
         let p = wsl_path_to_unc("Ubuntu", "/etc/hosts");
         let s = p.to_string_lossy();
         assert!(!s.contains("__terax_invalid_distro__"), "got: {s}");
+    }
+
+    #[test]
+    fn normalize_wsl_value_uses_last_nonempty_line() {
+        assert_eq!(
+            normalize_wsl_value("banner\n  /bin/zsh \n".into(), "/bin/sh"),
+            "/bin/zsh"
+        );
+    }
+
+    #[test]
+    fn normalize_wsl_value_falls_back_when_empty() {
+        assert_eq!(normalize_wsl_value(" \n".into(), "/bin/sh"), "/bin/sh");
     }
 }
