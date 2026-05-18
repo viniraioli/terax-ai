@@ -84,7 +84,7 @@ pub struct WslDistro {
 pub fn resolve_path(path: &str, workspace: &WorkspaceEnv) -> PathBuf {
     match workspace {
         WorkspaceEnv::Local => PathBuf::from(path),
-        WorkspaceEnv::Wsl { distro } => wsl_path_to_unc(distro, path),
+        WorkspaceEnv::Wsl { distro } => wsl_path_to_host(distro, path),
     }
 }
 
@@ -111,6 +111,27 @@ fn is_safe_distro_name(name: &str) -> bool {
 }
 
 #[cfg(windows)]
+fn wsl_drvfs_to_windows(path: &str) -> Option<PathBuf> {
+    let normalized = path.replace('\\', "/");
+    let rest = normalized.strip_prefix("/mnt/")?;
+    let mut parts = rest.splitn(2, '/');
+    let drive = parts.next()?;
+    if drive.len() != 1 {
+        return None;
+    }
+    let drive = drive.chars().next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let suffix = parts.next().unwrap_or("").replace('/', "\\");
+    let mut host = format!("{}:\\", drive.to_ascii_uppercase());
+    if !suffix.is_empty() {
+        host.push_str(&suffix);
+    }
+    Some(PathBuf::from(host))
+}
+
+#[cfg(windows)]
 pub fn wsl_path_to_unc(distro: &str, path: &str) -> PathBuf {
     // Defense-in-depth: refuse to construct a UNC path with a distro name that
     // could escape the WSL share root via `..`, `\`, or other path metachars.
@@ -132,6 +153,14 @@ pub fn wsl_path_to_unc(distro: &str, path: &str) -> PathBuf {
         return primary;
     }
     PathBuf::from(format!(r"\\wsl$\{}\{}", distro, trimmed.replace('/', r"\")))
+}
+
+#[cfg(windows)]
+pub fn wsl_path_to_host(distro: &str, path: &str) -> PathBuf {
+    // `/mnt/<drive>` is drvfs-backed Windows storage. Accessing it through the
+    // WSL UNC share can return "Access is denied" on Windows even though the
+    // same path is readable inside WSL. Use the native drive path instead.
+    wsl_drvfs_to_windows(path).unwrap_or_else(|| wsl_path_to_unc(distro, path))
 }
 
 #[cfg(windows)]
@@ -369,8 +398,27 @@ mod tests {
         };
         assert_eq!(
             resolve_path("/home/vinicios/repo", &workspace),
-            wsl_path_to_unc("Ubuntu", "/home/vinicios/repo")
+            wsl_path_to_host("Ubuntu", "/home/vinicios/repo")
         );
+    }
+
+    #[test]
+    fn wsl_drvfs_root_maps_to_windows_drive() {
+        assert_eq!(wsl_drvfs_to_windows("/mnt/c"), Some(PathBuf::from(r"C:\")));
+    }
+
+    #[test]
+    fn wsl_drvfs_child_maps_to_windows_drive() {
+        assert_eq!(
+            wsl_drvfs_to_windows("/mnt/d/Users/vinicios/repo"),
+            Some(PathBuf::from(r"D:\Users\vinicios\repo"))
+        );
+    }
+
+    #[test]
+    fn wsl_drvfs_rejects_non_drive_mounts() {
+        assert_eq!(wsl_drvfs_to_windows("/mnt/wsl"), None);
+        assert_eq!(wsl_drvfs_to_windows("/home/vinicios"), None);
     }
 
     #[test]
